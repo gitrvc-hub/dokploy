@@ -23,6 +23,8 @@ import { updateServersBasedOnQuantity } from "@/pages/api/stripe/webhook";
 import { createTRPCRouter, protectedProcedure } from "@/server/api/trpc";
 import { db } from "@/server/db";
 import {
+	apiCreateBYOSServer,
+	apiCreateManagedServer,
 	apiCreateServer,
 	apiFindOneServer,
 	apiRemoveServer,
@@ -37,7 +39,13 @@ import {
 	postgres,
 	redis,
 	server,
+	sshKeys,
 } from "@/server/db/schema";
+import {
+	provisionerFetch,
+	type ProvisionerJobResponse,
+	type ProvisionerJobStatus,
+} from "@dokploy/server/utils/provisioner/client";
 
 export const serverRouter = createTRPCRouter({
 	create: protectedProcedure
@@ -414,6 +422,220 @@ export const serverRouter = createTRPCRouter({
 			timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
 		};
 	}),
+	// ─── Cloud Provisioning ───────────────────────────────────────────────────
+
+	createManaged: protectedProcedure
+		.input(apiCreateManagedServer)
+		.mutation(async ({ ctx, input }) => {
+			const newServer = await db
+				.insert(server)
+				.values({
+					name: input.name,
+					description: input.description,
+					ipAddress: "",
+					port: 22,
+					username: "root",
+					organizationId: ctx.session.activeOrganizationId,
+					createdAt: new Date().toISOString(),
+					cloudProviderId: input.cloudProviderId,
+					sshKeyId: input.sshKeyId,
+					region: input.region,
+					serverSize: input.serverSize,
+					osImage: input.osImage,
+					serverType: input.serverType,
+					provisionStatus: "pending",
+					isBYOS: false,
+				})
+				.returning()
+				.then((v) => v[0]);
+
+			if (!newServer) {
+				throw new TRPCError({ code: "BAD_REQUEST", message: "Error creating server" });
+			}
+			return newServer;
+		}),
+
+	createBYOS: protectedProcedure
+		.input(apiCreateBYOSServer)
+		.mutation(async ({ ctx, input }) => {
+			const newServer = await db
+				.insert(server)
+				.values({
+					name: input.name,
+					description: input.description,
+					ipAddress: input.ipAddress,
+					port: 22,
+					username: "root",
+					organizationId: ctx.session.activeOrganizationId,
+					createdAt: new Date().toISOString(),
+					sshKeyId: input.sshKeyId,
+					serverType: input.serverType,
+					provisionStatus: "pending",
+					isBYOS: true,
+				})
+				.returning()
+				.then((v) => v[0]);
+
+			if (!newServer) {
+				throw new TRPCError({ code: "BAD_REQUEST", message: "Error creating BYOS server" });
+			}
+			return newServer;
+		}),
+
+	provision: protectedProcedure
+		.input(z.object({ serverId: z.string().min(1) }))
+		.mutation(async ({ ctx, input }) => {
+			const srv = await findServerById(input.serverId);
+			if (srv.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({ code: "UNAUTHORIZED" });
+			}
+			// Resolve SSH public key server-side
+			let sshPublicKey = "";
+			if (srv.sshKeyId) {
+				const sshKeyRecord = await db.query.sshKeys.findFirst({
+					where: (k, { eq }) => eq(k.sshKeyId, srv.sshKeyId!),
+				});
+				sshPublicKey = sshKeyRecord?.publicKey ?? "";
+			}
+			return provisionerFetch<ProvisionerJobResponse>(
+				`/servers/${input.serverId}/provision`,
+				{ method: "POST", body: JSON.stringify({ sshPublicKey }) },
+			);
+		}),
+
+	installK3s: protectedProcedure
+		.input(z.object({ serverId: z.string().min(1) }))
+		.mutation(async ({ ctx, input }) => {
+			const srv = await findServerById(input.serverId);
+			if (srv.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({ code: "UNAUTHORIZED" });
+			}
+			return provisionerFetch<ProvisionerJobResponse>(
+				`/servers/${input.serverId}/install-k3s`,
+				{ method: "POST" },
+			);
+		}),
+
+	byosSetup: protectedProcedure
+		.input(z.object({ serverId: z.string().min(1) }))
+		.mutation(async ({ ctx, input }) => {
+			const srv = await findServerById(input.serverId);
+			if (srv.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({ code: "UNAUTHORIZED" });
+			}
+			return provisionerFetch<ProvisionerJobResponse>(
+				`/servers/${input.serverId}/byos-setup`,
+				{ method: "POST" },
+			);
+		}),
+
+	destroyServer: protectedProcedure
+		.input(z.object({ serverId: z.string().min(1) }))
+		.mutation(async ({ ctx, input }) => {
+			const srv = await findServerById(input.serverId);
+			if (srv.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({ code: "UNAUTHORIZED" });
+			}
+			return provisionerFetch<ProvisionerJobResponse>(
+				`/servers/${input.serverId}/destroy`,
+				{ method: "POST" },
+			);
+		}),
+
+	provisionStatus: protectedProcedure
+		.input(z.object({ serverId: z.string().min(1) }))
+		.query(async ({ ctx, input }) => {
+			const srv = await findServerById(input.serverId);
+			if (srv.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({ code: "UNAUTHORIZED" });
+			}
+			return {
+				provisionStatus: srv.provisionStatus,
+				k3sInstalled: srv.k3sInstalled,
+				ipAddress: srv.ipAddress,
+			};
+		}),
+
+	watchJobLogs: protectedProcedure
+		.input(z.object({ jobId: z.string().min(1) }))
+		.subscription(async ({ input, ctx }) => {
+			// Ownership check: verify the job belongs to a server owned by this org
+			const jobRows = await db.execute<{ serverId: string }>(
+				sql`SELECT "serverId" FROM "provisioner_job" WHERE "jobId" = ${input.jobId}`,
+			);
+			if (jobRows.length === 0) {
+				throw new TRPCError({ code: "NOT_FOUND", message: "Job not found" });
+			}
+			const jobServerId = jobRows[0]!.serverId;
+			const srv = await findServerById(jobServerId);
+			if (srv.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({ code: "UNAUTHORIZED", message: "Not authorized to view this job" });
+			}
+			return observable<string>((emit) => {
+				// Fetch existing logs immediately, then stream new ones via SSE.
+				const url = `${process.env.PROVISIONER_URL ?? "http://provisioner:4600"}/jobs/${input.jobId}/stream`;
+				const apiKey = process.env.PROVISIONER_API_KEY ?? "";
+
+				const controller = new AbortController();
+				fetch(url, {
+					headers: { "X-API-Key": apiKey },
+					signal: controller.signal,
+				})
+					.then(async (res) => {
+						if (!res.body) {
+							emit.complete();
+							return;
+						}
+						const reader = res.body.getReader();
+						const decoder = new TextDecoder();
+						let buffer = "";
+						while (true) {
+							const { done, value } = await reader.read();
+							if (done) break;
+							buffer += decoder.decode(value, { stream: true });
+							const lines = buffer.split("\n");
+							buffer = lines.pop() ?? "";
+							for (const line of lines) {
+								if (line.startsWith("data: ")) {
+									const data = line.slice(6).trim();
+									if (data === "[DONE]") {
+										emit.complete();
+										return;
+									}
+									emit.next(data);
+								}
+							}
+						}
+						emit.complete();
+					})
+					.catch((err) => {
+						if (err.name !== "AbortError") {
+							emit.error(err);
+						}
+					});
+
+				return () => controller.abort();
+			});
+		}),
+
+	getJobStatus: protectedProcedure
+		.input(z.object({ jobId: z.string().min(1) }))
+		.query(async ({ input, ctx }) => {
+			// Ownership check
+			const jobRows = await db.execute<{ serverId: string }>(
+				sql`SELECT "serverId" FROM "provisioner_job" WHERE "jobId" = ${input.jobId}`,
+			);
+			if (jobRows.length === 0) {
+				throw new TRPCError({ code: "NOT_FOUND", message: "Job not found" });
+			}
+			const jobServerId = jobRows[0]!.serverId;
+			const srv = await findServerById(jobServerId);
+			if (srv.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({ code: "UNAUTHORIZED", message: "Not authorized to view this job" });
+			}
+			return provisionerFetch<ProvisionerJobStatus>(`/jobs/${input.jobId}`);
+		}),
+
 	getServerMetrics: protectedProcedure
 		.input(
 			z.object({

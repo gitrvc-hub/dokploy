@@ -1,6 +1,7 @@
 import { format } from "date-fns";
 import {
 	Clock,
+	CloudOff,
 	Key,
 	KeyIcon,
 	Loader2,
@@ -10,14 +11,22 @@ import {
 	Terminal,
 	Trash2,
 	User,
+	Wrench,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/router";
+import { useState } from "react";
 import { toast } from "sonner";
 import { AlertBlock } from "@/components/shared/alert-block";
 import { DialogAction } from "@/components/shared/dialog-action";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+	Dialog,
+	DialogContent,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
 import {
 	Card,
 	CardContent,
@@ -48,7 +57,17 @@ import { ShowMonitoringModal } from "./show-monitoring-modal";
 import { ShowSchedulesModal } from "./show-schedules-modal";
 import { ShowSwarmOverviewModal } from "./show-swarm-overview-modal";
 import { ShowTraefikFileSystemModal } from "./show-traefik-file-system-modal";
+import { ProvisionServerLogs } from "./provision-server-logs";
 import { WelcomeSuscription } from "./welcome-stripe/welcome-suscription";
+
+const PROVISION_STATUS_COLORS: Record<string, string> = {
+	pending: "bg-yellow-500/10 text-yellow-500 border-yellow-500/20",
+	provisioning: "bg-blue-500/10 text-blue-500 border-blue-500/20",
+	provisioned: "bg-green-500/10 text-green-500 border-green-500/20",
+	failed: "bg-red-500/10 text-red-500 border-red-500/20",
+	destroying: "bg-orange-500/10 text-orange-500 border-orange-500/20",
+	destroyed: "bg-gray-500/10 text-gray-400 border-gray-500/20",
+};
 
 export const ShowServers = () => {
 	const router = useRouter();
@@ -59,6 +78,10 @@ export const ShowServers = () => {
 	const { data: isCloud } = api.settings.isCloud.useQuery();
 	const { data: canCreateMoreServers } =
 		api.stripe.canCreateMoreServers.useQuery();
+	const { mutateAsync: destroyServer } = api.server.destroyServer.useMutation();
+	const { mutateAsync: installK3s } = api.server.installK3s.useMutation();
+	const [activeJobId, setActiveJobId] = useState<string | null>(null);
+	const [jobDialogOpen, setJobDialogOpen] = useState(false);
 
 	return (
 		<div className="w-full">
@@ -180,6 +203,49 @@ export const ShowServers = () => {
 																						<ShowSchedulesModal
 																							serverId={server.serverId}
 																						/>
+																						{server.cloudProviderId && server.provisionStatus === "provisioned" && (
+																							<button
+																								type="button"
+																								className="relative flex w-full cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm hover:bg-accent outline-none"
+																								onClick={async () => {
+																									try {
+																										const { jobId } = await installK3s({ serverId: server.serverId });
+																										setActiveJobId(jobId);
+																										setJobDialogOpen(true);
+																										toast.success("K3s installation started");
+																									} catch (err) {
+																										toast.error(err instanceof Error ? err.message : "Error starting K3s install");
+																									}
+																								}}
+																							>
+																								<Wrench className="size-4 mr-2" />
+																								Install K3s
+																							</button>
+																						)}
+																						{server.cloudProviderId && server.provisionStatus !== "destroyed" && (
+																							<DialogAction
+																								title="Destroy VM"
+																								description="This will destroy the VM and all data on it. This action cannot be undone."
+																								onClick={async () => {
+																									try {
+																										const { jobId } = await destroyServer({ serverId: server.serverId });
+																										setActiveJobId(jobId);
+																										setJobDialogOpen(true);
+																										toast.success("VM destruction started");
+																									} catch (err) {
+																										toast.error(err instanceof Error ? err.message : "Error destroying server");
+																									}
+																								}}
+																							>
+																								<button
+																									type="button"
+																									className="relative flex w-full cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm text-destructive hover:bg-destructive/10 outline-none"
+																								>
+																									<CloudOff className="size-4 mr-2" />
+																									Destroy VM
+																								</button>
+																							</DialogAction>
+																						)}
 																					</DropdownMenuContent>
 																				</DropdownMenu>
 																			)}
@@ -229,6 +295,22 @@ export const ShowServers = () => {
 																			>
 																				{server.serverType}
 																			</Badge>
+																			{server.cloudProviderId && server.provisionStatus && (
+																				<Badge
+																					variant="outline"
+																					className={PROVISION_STATUS_COLORS[server.provisionStatus] ?? ""}
+																				>
+																					{server.provisionStatus}
+																				</Badge>
+																			)}
+																			{server.cloudProviderId && server.k3sInstalled && (
+																				<Badge
+																					variant="outline"
+																					className="bg-emerald-500/10 text-emerald-500 border-emerald-500/20"
+																				>
+																					K3s
+																				</Badge>
+																			)}
 																		</div>
 																	</TooltipProvider>
 																</CardHeader>
@@ -447,6 +529,31 @@ export const ShowServers = () => {
 					</CardContent>
 				</div>
 			</Card>
+
+			{/* Provisioning job logs dialog */}
+			<Dialog open={jobDialogOpen} onOpenChange={(open) => {
+				setJobDialogOpen(open);
+				if (!open) {
+					setActiveJobId(null);
+					refetch();
+				}
+			}}>
+				<DialogContent className="max-w-lg">
+					<DialogHeader>
+						<DialogTitle>Provisioning Logs</DialogTitle>
+					</DialogHeader>
+					{activeJobId && (
+						<ProvisionServerLogs
+							jobId={activeJobId}
+							onDone={() => {
+								setJobDialogOpen(false);
+								setActiveJobId(null);
+								refetch();
+							}}
+						/>
+					)}
+				</DialogContent>
+			</Dialog>
 		</div>
 	);
 };
