@@ -1,0 +1,39 @@
+terraform {
+  required_providers {
+    hcloud = {
+      source  = "hetznercloud/hcloud"
+      version = "~> 1.45"
+    }
+  }
+}
+
+provider "hcloud" {
+  token = "{{.ProviderToken}}"
+}
+
+resource "hcloud_server" "server" {
+  name        = "{{.ServerName}}"
+  server_type = "{{.Size}}"
+  location    = "{{.Region}}"
+  image       = "{{.OS}}"
+  ssh_keys    = [{{.SSHKeyCloudID}}]
+  user_data   = file("${path.module}/cloud-init.yml")
+
+  public_net {
+    ipv4_enabled = true
+    ipv6_enabled = true
+  }
+
+  labels = {
+    managed-by = "dokploy"
+    server-id  = "{{.ServerID}}"
+  }
+}
+
+output "server_ip" {
+  value = hcloud_server.server.ipv4_address
+}
+
+output "provider_server_id" {
+  value = tostring(hcloud_server.server.id)
+}
